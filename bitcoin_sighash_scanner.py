@@ -13,9 +13,14 @@ a constant value (0x01), making funds potentially vulnerable.
 import argparse
 import logging
 import sys
+from decimal import Decimal, getcontext
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
+
+# Configure decimal context to handle Bitcoin's precision
+# Set high precision to avoid InvalidOperation errors
+getcontext().prec = 28
 
 
 # SIGHASH types
@@ -41,8 +46,13 @@ class BitcoinSigHashScanner:
             connection_str = f"http://{rpc_user}:{rpc_password}@{rpc_url.replace('http://', '')}"
         else:
             connection_str = rpc_url
+        
+        try:
+            self.rpc = AuthServiceProxy(connection_str, timeout=120)
+        except Exception as e:
+            logging.error(f"Failed to create RPC connection: {e}")
+            raise
             
-        self.rpc = AuthServiceProxy(connection_str)
         self.utxos: Dict[Tuple[str, int], dict] = {}
         
     def get_block_height(self) -> int:
