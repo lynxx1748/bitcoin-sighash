@@ -11,16 +11,39 @@ a constant value (0x01), making funds potentially vulnerable.
 """
 
 import argparse
+import json
 import logging
 import sys
-from decimal import Decimal, getcontext
+from decimal import Decimal, getcontext, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
 
 # Configure decimal context to handle Bitcoin's precision
-# Set high precision to avoid InvalidOperation errors
-getcontext().prec = 28
+# Set high precision and disable traps to avoid InvalidOperation errors
+ctx = getcontext()
+ctx.prec = 50  # Very high precision for Bitcoin amounts
+ctx.Emax = 999999
+ctx.Emin = -999999
+ctx.rounding = ROUND_HALF_UP
+# Disable the InvalidOperation trap
+ctx.traps[InvalidOperation] = 0
+
+# Monkey-patch json module to parse floats as strings to avoid decimal issues
+# This prevents precision loss when bitcoinrpc parses JSON responses
+_original_loads = json.loads
+
+def _patched_loads(*args, **kwargs):
+    """Parse JSON with float values as Decimal to avoid precision issues."""
+    kwargs['parse_float'] = Decimal
+    try:
+        return _original_loads(*args, **kwargs)
+    except InvalidOperation:
+        # If Decimal parsing fails, fall back to float
+        kwargs.pop('parse_float', None)
+        return _original_loads(*args, **kwargs)
+
+json.loads = _patched_loads
 
 
 # SIGHASH types
@@ -55,11 +78,28 @@ class BitcoinSigHashScanner:
             
         self.utxos: Dict[Tuple[str, int], dict] = {}
         
+        # Test the connection
+        try:
+            self.rpc.getblockchaininfo()
+            logging.info("✅ Successfully connected to Bitcoin RPC")
+        except Exception as e:
+            logging.error(f"Failed to test RPC connection: {e}")
+            raise
+        
     def get_block_height(self) -> int:
         """Get the current blockchain height."""
         try:
             mining_info = self.rpc.getmininginfo()
             return mining_info['blocks']
+        except InvalidOperation as e:
+            logging.error(f"Decimal error in getmininginfo: {e}")
+            logging.error("Trying alternative method with getblockchaininfo...")
+            try:
+                blockchain_info = self.rpc.getblockchaininfo()
+                return blockchain_info['blocks']
+            except Exception as e2:
+                logging.error(f"Alternative method also failed: {e2}")
+                raise
         except JSONRPCException as e:
             logging.error(f"Failed to fetch blockchain height: {e}")
             raise
@@ -339,8 +379,18 @@ Read more: https://github.com/MatanHamilis/sighash_post
         scanner = BitcoinSigHashScanner(rpc_url, rpc_user, rpc_password)
         scanner.scan_blockchain(args.start_height, args.end_height)
         logging.info("✅ Scan completed successfully!")
+    except InvalidOperation as e:
+        logging.error(f"Decimal error: {e}")
+        logging.error("This may be caused by incompatible Bitcoin RPC response format.")
+        logging.error("Try upgrading python-bitcoinrpc: pip install --upgrade python-bitcoinrpc")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
     except Exception as e:
         logging.error(f"Scanner error: {e}")
+        logging.error(f"Error type: {type(e)}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
