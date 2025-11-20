@@ -107,36 +107,3 @@ def test_signature_extraction():
 
 if __name__ == '__main__':
     test_signature_extraction()
-
-================================================================================
-SIGNATURE EXTRACTION DEBUG TEST
-================================================================================
-
-[Block 170]
-  Transactions in block: 2
-  TX f4184fc596403b9d... Input 0: scriptSig found (144 chars)
-    First 100 chars: 47304402204e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd410220181522ec8eca07de4860a4
-    Hex decoded: 72 bytes
-    First 20 bytes: 47304402204e45e16932b8af514961a1d3a1a25f
-    Push opcode: 71
-    ✅ DER signature detected!
-  Total signatures found: 1
-
-[Block 500]
-  Transactions in block: 1
-  Total signatures found: 0
-  ⚠️  WARNING: No signatures found in block!
-
-[Block 1000]
-  Transactions in block: 1
-  Total signatures found: 0
-  ⚠️  WARNING: No signatures found in block!
-
-[Block 10000]
-  Transactions in block: 1
-  Total signatures found: 0
-  ⚠️  WARNING: No signatures found in block!
-
-================================================================================
-DEBUG TEST COMPLETE
-================================================================================
