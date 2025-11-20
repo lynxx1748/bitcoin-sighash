@@ -291,44 +291,6 @@ When keys are recovered, they're automatically saved to `recovered_keys.json`:
    - ✅ Address derivation
    - ✅ JSON export of findings
 
-## 💼 Using Recovered Keys
-
-### Importing WIF Keys into Wallets
-
-If you've recovered a private key, you can import it into various Bitcoin wallets:
-
-#### Bitcoin Core
-```bash
-# Import the WIF key
-bitcoin-cli importprivkey "5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ" "recovered_key"
-
-# Check the balance
-bitcoin-cli getbalance
-```
-
-#### Electrum Wallet
-1. Open Electrum
-2. Go to Wallet → Private Keys → Import
-3. Paste the WIF key
-4. The balance will appear automatically
-
-#### Hardware Wallets
-Most hardware wallets support importing private keys for recovery purposes. Check your device's documentation.
-
-### Sweeping Funds
-
-If you find funds on a recovered key, you can sweep them to a secure address:
-
-```bash
-# Using Bitcoin Core
-bitcoin-cli sendtoaddress "YOUR_SECURE_ADDRESS" <amount> "" "" true
-
-# Or create a raw transaction for full control
-bitcoin-cli createrawtransaction '[{"txid":"...","vout":0}]' '{"YOUR_ADDRESS":<amount>}'
-```
-
-**⚠️ WARNING**: Only sweep funds from keys you legitimately own or have permission to recover!
-
 ## 📈 Performance
 
 ### Scanning Speed
